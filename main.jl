@@ -1,8 +1,7 @@
-# using Random
+using Random
 using LinearAlgebra
 import PythonPlot as plt
-
-# Random.seed!(123)
+using Dates
 
 println("Finished Importing")
 
@@ -50,12 +49,26 @@ function generate_rand_1rdm(N, N_e)
 end
 
 
-function HF_Hubbard_Hamiltonian(N, t, U, P)
-    # need to explicitly set them to complex to avoid problems later
-    T_term = zeros(ComplexF64, 2*N, 2*N)
-    U_term = zeros(ComplexF64, 2*N, 2*N)
+function neel_seed(N, N_e; amplitude = 0.4)
+    n̄ = N_e / (2N)
+    a = min(amplitude, n̄, 1 - n̄)
+    P = zeros(2N, 2N)
+    for i in 1:N
+        n_up = isodd(i) ? n̄ + a : n̄ - a
+        P[i, i]     = n_up
+        P[i+N, i+N] = 2n̄ - n_up
+    end
+    return P
+end
 
-    # hopping term
+
+# ============================================
+# Hartree-Fock machinery
+# ============================================
+
+function hopping_matrix(N, t)
+    T_term = zeros(ComplexF64, 2*N, 2*N)
+
     for i in 1:2*N          # rows
         for j in 1:2*N      # columns
             # same spin 
@@ -76,28 +89,27 @@ function HF_Hubbard_Hamiltonian(N, t, U, P)
             end
         end
     end
+    return T_term
+end
 
-    # on-site repulsion term
-    for i in 1:2*N
-        for j in 1:2*N 
-            site_i = mod1(i, N)
-            site_j = mod1(j, N)
-            spin_i = fld(i - 1, N)
-            spin_j = fld(j - 1, N)
 
-            Hartree_term = delta(spin_i, spin_j) * P[i, j]
-            Fock_term = (1 - delta(spin_i, spin_j)) * P[i, j]
+function HF_Hubbard_Hamiltonian(N, T, U, P)
+    # need to explicitly set them to complex to avoid problems later
+    H = copy(T)
 
-            U_term[i, j] = U * delta(site_i, site_j) * (Hartree_term - Fock_term)
-        end
+    # CORRECTED (what I had before was wrong): 
+    for i in 1:N
+        H[i, i]         += U * real(P[i+N, i+N])
+        H[i+N, i+N]     += U * real(P[i, i])
+        H[i, i+N]       -= U * P[i, i+N]
+        H[i+N, i]       -= U * P[i+N, i]
     end
-
-    H = T_term + U_term   # construct full HF hamiltonian
     return H
 end
 
 
 function SCF_optimization(N, N_e, t, U, P_0, ϵ, max_iter)
+    T = hopping_matrix(N, t)
     P_k_tilde = P_0
 
     for k in 1:max_iter
@@ -105,31 +117,30 @@ function SCF_optimization(N, N_e, t, U, P_0, ϵ, max_iter)
         # global P_k_tilde    # setting this to global scope so it can be modified in the loop
         
         # construct k_th Hamiltonian 
-        H_k_tilde = HF_Hubbard_Hamiltonian(N, t, U, P_k_tilde)
-        log("Calculated hamiltonian")
+        H_k_tilde = HF_Hubbard_Hamiltonian(N, T, U, P_k_tilde)
+        # log("Calculated hamiltonian")
 
         # diagonalize k_th Hamiltonian
         eigenvalues, eigenvectors = eigen(H_k_tilde)
-        log("Diagonalized hamiltonian")
+        # log("Diagonalized hamiltonian")
 
         # keeping first N_e eigenvectors (lowest energy orbitals)
         orbitals = eigenvectors[:, 1:N_e]
 
         # constructing temporary next density matrix using occupied orbitals O(N^3)
         P_k₊ = orbitals * orbitals' 
-        log("Constructed new density matrix")
+        # log("Constructed new density matrix")
 
         # checking convergence
         difference = norm(P_k₊ - P_k_tilde)
         log("difference = $difference")
         if difference < ϵ
-            P_k_tilde = P_k₊
-            break
+            return P_k₊
         end
 
         # compute temporary next hamiltonian
-        H_k₊ = HF_Hubbard_Hamiltonian(N, t, U, P_k₊)
-        log("Calculated temporary hamiltonian")
+        H_k₊ = HF_Hubbard_Hamiltonian(N, T, U, P_k₊)
+        # log("Calculated temporary hamiltonian")
 
         # computing s and c coefficients for optimal mixing scheme
         s = real(2 * tr(H_k_tilde * (P_k₊ - P_k_tilde)))
@@ -138,12 +149,37 @@ function SCF_optimization(N, N_e, t, U, P_0, ϵ, max_iter)
         # building k+1_th optimally mixed 1rdm
         λ = (c <= -s / 2) ? 1 : (-s / (2 * c))
         P_k₊_tilde = (1 - λ) * P_k_tilde + λ * P_k₊
-        log("Constructed next density matrix")
+        # log("Constructed next density matrix")
 
         P_k_tilde = P_k₊_tilde
     end
 
+    @warn "SCF did not converge"
     return P_k_tilde
+end
+
+
+# ============================================
+# Analytics Functions
+# ============================================
+
+"""
+|Sz(A) - Sz(B)| for a range of U/t values.
+Each U starts from a fresh Néel seed (to reach AFM configuration).
+"""
+function spin_difference_2_sites(N, N_e, Ut_ratio_max, n_samples, ϵ, max_iter, site_A, site_B)
+    ut_vals = [(i / (n_samples - 1)) * Ut_ratio_max for i in 0:(n_samples - 1)]
+    diffs = Float64[]
+
+    for ut in ut_vals
+        P_0 = neel_seed(N, N_e)     # because we are looking for AFM (to try to match Ivan's plot)
+        P_out = SCF_optimization(N, N_e, 1, ut, P_0, ϵ, max_iter)
+
+        Sz_A = 0.5 * real(P_out[site_A, site_A] - P_out[site_A + N, site_A + N])
+        Sz_B = 0.5 * real(P_out[site_B, site_B] - P_out[site_B + N, site_B + N])
+        push!(diffs, abs(Sz_A - Sz_B))
+    end
+    return diffs
 end
 
 
@@ -159,15 +195,7 @@ end
 
 
 function Sz_ev_profile(P, N)     # spin-z expectation value profile
-    Sz = zeros(N)
-    
-    for i in 1:N
-        n_up = real(P[i, i])
-        n_down = real(P[N + i, N + i])
-
-        Sz[i] = 0.5 * (n_up - n_down)
-    end
-    return Sz
+    return [0.5 * real(P[i, i] - P[i + N, i + N]) for i in 1:N]
 end
 
 
@@ -194,45 +222,26 @@ end
 
 
 # ============================================
-# Analytics Functions
+# Code for testing
 # ============================================
 
-"""
-Generate a plot of Sz difference between 2 fixed sites over a range of U/t values at fixed N, N_e
-"""
-function generate_spin_diagram_2_sites(N, N_e, Ut_ratio_max, n_samples)
-    ut_vals = [(i + 1) * Ut_ratio_max for i in 0:(n_samples - 1)]
-end 
+Random.seed!(123)
 
-# ============================================
-# Setting variables
-# ============================================
-
-N = 100                               # orbitals
-N_e = 40                              # electrons (N_e <= 2N)
-P_0 = generate_rand_1rdm(N, N_e)      # 1rdm (initial guess)
-t = 1                                 # hopping term
-U = 1                                 # on site repulsion
-max_iter = 100
+N = 30
+N_e = 30
+ut_max = 10
+samples = 16
 ϵ = 1e-6
+max_iter = 200
 
+ut_range = 0:(10/(samples - 1)):10
 
-# ============================================
-# Running the SCF algorithm
-# ============================================
+Sz_diff = spin_difference_2_sites(N, N_e, ut_max, samples, ϵ, max_iter, 1, 2)
 
-P_out = SCF_optimization(N, N_e, t, U, P_0, ϵ, max_iter)
-
-# ============================================
-# Performing Tests and Calculations
-# ============================================
-
-check_1rdm(P_out)
-
-S = spin_magnitude_profile(P_out, N)
-
-plt.plot(1:N, S)
+plt.figure()
+plt.scatter(ut_range, Sz_diff)
+plt.xlabel("U/t")
+plt.ylabel("|Sz(A) - Sz(B)|")
+plt.title("Hubbard ring (periodic), half filling, N = $N")
+plt.savefig("comparison_plot.png")
 plt.show()
-
-# calculate net magnetization (EV of spin-z operator with P_out)
-
