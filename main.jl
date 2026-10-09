@@ -5,9 +5,9 @@ using Dates
 
 println("Finished Importing")
 
-# ============================================
+# ========================================================================================
 # Defining Utility Functions
-# ============================================
+# ========================================================================================
 
 delta(i, j) = (i == j) ? 1 : 0    # Kronecker delta function
 
@@ -56,9 +56,9 @@ function neel_seed(N, N_e; amplitude = 0.4)
 end
 
 
-# ============================================
+# ========================================================================================
 # Hartree-Fock machinery (Real space)
-# ============================================
+# ========================================================================================
 
 function hopping_matrix_real_space(N, t)
     T_term = zeros(ComplexF64, 2*N, 2*N)
@@ -234,13 +234,12 @@ function SCF_HF(N, N_e, t, U, P_0, ϵ, max_iter; real_space=true, kT=0)
             H_k₊ = HF_Hubbard_Hamiltonian_k_space(N, T, U, P_k₊)
         end
 
-        # # computing s and c coefficients for optimal mixing scheme
-        # s = real(2 * tr(H_k_tilde * (P_k₊ - P_k_tilde)))
-        # c = real(tr((H_k₊ - H_k_tilde) * (P_k₊ - P_k_tilde)))
+        # computing s and c coefficients for optimal mixing scheme
+        s = real(2 * tr(H_k_tilde * (P_k₊ - P_k_tilde)))
+        c = real(tr((H_k₊ - H_k_tilde) * (P_k₊ - P_k_tilde)))
 
-        # # building k+1_th optimally mixed 1rdm
-        # λ = (c <= -s / 2) ? 1 : (-s / (2 * c))
-        λ = 1.
+        # building k+1_th optimally mixed 1rdm
+        λ = (c <= -s / 2) ? 1 : (-s / (2 * c))
         P_k₊_tilde = (1 - λ) * P_k_tilde + λ * P_k₊
 
         P_k_tilde = P_k₊_tilde
@@ -251,9 +250,257 @@ function SCF_HF(N, N_e, t, U, P_0, ϵ, max_iter; real_space=true, kT=0)
 end
 
 
-# ============================================
+# ========================================================================================
+# RHF Functions (using GHF framework [doesn't work that well])
+# ========================================================================================
+
+function generate_rand_restricted_1rdm(N, N_e)
+    nocc = Int(N_e / 2)                       # orbitals per spin
+    V = random_unitary(N)                # N×N, not 2N×2N
+    Pσ = V[:, 1:nocc] * V[:, 1:nocc]'    # rank-nocc projector
+    P = zeros(ComplexF64, 2N, 2N)
+    P[1:N, 1:N] = Pσ
+    P[N+1:2N, N+1:2N] = Pσ
+    return P
+end
+
+
+"""Forces P to have the diagonal stripe form (for RHF, 2 site cells)"""
+function restrict(P, N)
+    Pavg = (P[1:N, 1:N] + P[N+1:2N, N+1:2N]) / 2
+    Pr = zeros(eltype(P), 2N, 2N)
+    Pr[1:N, 1:N] = Pavg
+    Pr[N+1:2N, N+1:2N] = Pavg
+    return Pr
+end
+
+
+function SCF_RHF(N, N_e, t, U, P_0, ϵ, max_iter; kT=0)
+    T = hopping_matrix_k_space(N, t)
+    P_k_tilde = P_0
+
+    for k in 1:max_iter
+        println("Iteration $k")
+        
+        # construct k_th Hamiltonian 
+        H_k_tilde = HF_Hubbard_Hamiltonian_k_space(N, T, U, P_k_tilde)
+
+        # diagonalize k_th Hamiltonian
+        eigen_energies, orbitals = eigen(Hermitian(H_k_tilde))
+
+        # keeping first N_e eigenvectors (lowest energy orbitals)
+        if kT == 0
+            C_occ = zeros(2*N, 2*N)
+            for i in 1:N_e
+                C_occ[i, i] = 1
+            end
+        else
+            μ = find_chemical_potential(N_e, eigen_energies, kT)
+            C_occ = diagm(fermi.(-(1 / kT) .* (μ .- eigen_energies)))
+        end
+
+        # constructing temporary next density matrix using occupied orbitals O(N^3)
+        P_k₊ = orbitals * C_occ * orbitals'
+        P_k₊ = restrict(P_k₊, N)    # applying RHF restriction
+
+        # checking convergence
+        difference = norm(P_k₊ - P_k_tilde)
+        println("difference = $difference")
+        if difference < ϵ
+            return P_k₊
+        end
+
+        # compute temporary next hamiltonian
+        H_k₊ = HF_Hubbard_Hamiltonian_k_space(N, T, U, P_k₊)
+
+        # computing s and c coefficients for optimal mixing scheme
+        s = real(2 * tr(H_k_tilde * (P_k₊ - P_k_tilde)))
+        c = real(tr((H_k₊ - H_k_tilde) * (P_k₊ - P_k_tilde)))
+
+        # building k+1_th optimally mixed 1rdm
+        λ = (c <= -s / 2) ? 1 : (-s / (2 * c))
+        P_k₊_tilde = (1 - λ) * P_k_tilde + λ * P_k₊   # still in the restricted form
+
+        P_k_tilde = P_k₊_tilde
+    end
+
+    @warn "SCF did not converge"
+    return P_k_tilde
+end
+
+
+function magnetization_alternating_sites_RHF(N, N_e, Ut_ratio_max, n_samples, ϵ, max_iter; kT=0)
+    ut_vals = [(i / (n_samples - 1)) * Ut_ratio_max for i in 0:(n_samples - 1)]
+    diffs = Float64[]
+
+    for ut in ut_vals
+        # the choice of ansatz here is actually really crucial (also only works for half filling)
+        P_0 = generate_rand_restricted_1rdm(N, N_e)
+        P_k_out = SCF_RHF(N, N_e, 1, ut, P_0, ϵ, max_iter, kT=kT)
+        P_out = k_to_real_P(P_k_out, N)
+        
+        # calculating alternating site magnetization
+        mag = zeros(3)
+        for i in 1:N 
+            Sx = real(P_out[i, i + N]) * (-1)^(i - 1)
+            Sy = -imag(P_out[i, i + N]) * (-1)^(i - 1)
+            Sz = 0.5 * real(P_out[i, i] - P_out[i + N, i + N]) * (-1)^(i - 1)
+            mag += [Sx, Sy, Sz]
+        end
+        mag ./= N 
+
+        push!(diffs, dot(mag, mag))
+    end
+    return diffs
+end
+
+
+# ========================================================================================
+# RHF Functions (2 site unit cells)
+# ========================================================================================
+
+"""
+Collinear UHF block-diagonal Hamiltonian at momentum k, basis (1↑, 2↑, 1↓, 2↓).
+b  : double-cell length (2x nearest-neighbour distance)
+P  : k-averaged 4x4 density matrix (only the diagonal enters the Hartree term)
+"""
+function UHF_Hamiltonian(k, b, P, t, U)
+    γ   = -(1 + exp(-im * k * b))
+    off = t * γ
+    H_up   = [U*real(P[3,3])  off;
+              conj(off)       U*real(P[4,4])]
+    H_down = [U*real(P[1,1])  off;
+              conj(off)       U*real(P[2,2])]
+    Z = zeros(ComplexF64, 2, 2)
+    return Hermitian([H_up Z; Z H_down])
+end
+
+"""
+Occupation numbers f[i,n] for the pooled spectrum evals[i,n] (k-index i, band n).
+kT == 0 : fill lowest Ne states, sharing electrons equally within a degenerate shell at the cut.
+kT  > 0 : Fermi-Dirac, μ found by bisection so that Σf = Ne.
+Returns (f, μ).
+"""
+function occupations(evals, Ne, kT; tol=1e-9)
+    flat = vec(evals)
+    if kT == 0
+        EF    = sort(flat)[Ne]
+        below = flat .< EF - tol
+        ties  = abs.(flat .- EF) .<= tol
+        f = zeros(length(flat))
+        f[below] .= 1.0
+        f[ties]  .= (Ne - count(below)) / count(ties)
+        return reshape(f, size(evals)), EF
+    else
+        fermi(E, μ) = 0.5 * (1 - tanh((E - μ) / (2kT)))   # overflow-safe
+        lo, hi = minimum(flat) - 20kT, maximum(flat) + 20kT
+        for _ in 1:200
+            μ = (lo + hi) / 2
+            sum(fermi.(flat, μ)) < Ne ? (lo = μ) : (hi = μ)
+        end
+        μ = (lo + hi) / 2
+        return reshape(fermi.(flat, μ), size(evals)), μ
+    end
+end
+
+"""
+One pass: build and diagonalize H(k) for every k from the SAME P̄, fill globally,
+return the per-k density matrices P(k), their average P̄_new, the H(k)'s and μ.
+"""
+function diagonalize_and_fill(ks, b, Pbar, t, U, Ne, kT)
+    N  = length(ks)
+    Hs = [UHF_Hamiltonian(k, b, Pbar, t, U) for k in ks]
+    es = [eigen(H) for H in Hs]
+    evals = [es[i].values[n] for i in 1:N, n in 1:4]
+
+    f, μ = occupations(evals, Ne, kT)
+
+    Pk = [es[i].vectors * Diagonal(f[i, :]) * es[i].vectors' for i in 1:N]
+    Pbar_new = sum(Pk) / N
+    return Pk, Pbar_new, Hs, μ
+end
+
+"""
+HF energy per unit cell (no entropy term): (1/N) Σ_k tr[h0(k) P(k)] + U Σ_α n_α↑ n_α↓
+"""
+function HF_energy(ks, b, Pk, Pbar, t, U)
+    N = length(ks)
+    Ekin = sum(real(tr(UHF_Hamiltonian(k, b, Pbar, t, 0.0) * Pk[i]))
+               for (i, k) in enumerate(ks)) / N
+    Eint = U * real(Pbar[1,1]*Pbar[3,3] + Pbar[2,2]*Pbar[4,4])
+    return Ekin + Eint
+end
+
+"""
+UHF SCF with ODA. P_0 is a 4x4 initial (k-averaged) density matrix.
+N : number of double cells, N_e : total electrons (L = 2N sites, half filling → N_e = 2N)
+Returns (P̄, E, μ).
+"""
+function SCF_2_site_cells_HF(N, N_e, t, U, P_0; b=1.0, kT=0.0, ϵ=1e-6, max_iter=1000)
+    ks = [2π * m / (N * b) for m in 1:N]          # m = 1..N
+
+    # first step: full step from the initial guess
+    Pk_t, Pbar_t, _, μ = diagonalize_and_fill(ks, b, P_0, t, U, N_e, kT)
+
+    for iter in 1:max_iter
+        # H(k) built from the current mixed P̄, then new P(k) and P̄⁺
+        Pk_p, Pbar_p, Hs, μ = diagonalize_and_fill(ks, b, Pbar_t, t, U, N_e, kT)
+
+        # convergence: distance between output and input density
+        difference = norm(Pbar_p - Pbar_t)
+        println("Iteration $iter: difference = $difference")
+        if difference < ϵ
+            E = HF_energy(ks, b, Pk_p, Pbar_p, t, U)
+            return Pbar_p, E, μ
+        end
+
+        # ODA: E(λ) = E(P̃) + s λ + c λ², with ΔP = P⁺ - P̃
+        ΔPk   = Pk_p .- Pk_t
+        ΔPbar = Pbar_p - Pbar_t
+        s = real(sum(tr(Hs[i] * ΔPk[i]) for i in 1:N)) / N
+        c = U * real(ΔPbar[1,1]*ΔPbar[3,3] + ΔPbar[2,2]*ΔPbar[4,4])
+        λ = c > 0 ? clamp(-s / (2c), 0.0, 1.0) : 1.0
+
+        Pk_t   = (1 - λ) .* Pk_t .+ λ .* Pk_p
+        Pbar_t = (1 - λ) * Pbar_t + λ * Pbar_p
+    end
+
+    @warn "SCF did not converge"
+    Pk_f = Pk_t
+    return Pbar_t, HF_energy(ks, b, Pk_f, Pbar_t, t, U), μ
+end
+
+
+function bands_2site(Pbar, t, U; b=1.0, nk=401)
+    kb = range(-π, π; length=nk)            # k*b over one double-cell BZ
+    ks = kb ./ b
+    E_up = zeros(nk, 2); E_dn = zeros(nk, 2)
+    for (i, k) in enumerate(ks)
+        H = Matrix(UHF_Hamiltonian(k, b, Pbar, t, U))
+        E_up[i, :] = eigvals(Hermitian(H[1:2, 1:2]))
+        E_dn[i, :] = eigvals(Hermitian(H[3:4, 3:4]))
+    end
+    x = ks .* (b / 2) ./ π                  # k·a / π, with a = b/2
+    return x, E_up, E_dn
+end
+
+function plot_bands_2site(Pbar, t, U, μ; b=1.0, nk=401)
+    x, E_up, E_dn = bands_2site(Pbar, t, U; b, nk)
+    fig = plt.figure(figsize=(6, 5)); ax = fig.add_subplot(1, 1, 1)
+    for n in 1:2
+        ax.plot(x, E_up[:, n], "b-";  label = n == 1 ? raw"$\uparrow$" : nothing)
+        ax.plot(x, E_dn[:, n], "r--"; label = n == 1 ? raw"$\downarrow$" : nothing)
+    end
+    ax.axhline(μ; color="k", ls=":", lw=0.8)
+    ax.set_xlabel(raw"$ka/\pi$"); ax.set_ylabel("E")
+    ax.legend(); fig.tight_layout()
+    return fig
+end
+
+
+# ========================================================================================
 # Analytics Functions 
-# ============================================
+# ========================================================================================
 
 """Convert density matrix from k to real space"""
 function k_to_real_P(P_k, N)
@@ -333,7 +580,7 @@ function magnetization_alternating_sites(N, N_e, Ut_ratio_max, n_samples, ϵ, ma
         if real_space
             P_out = SCF_HF(N, N_e, 1, ut, P_0, ϵ, max_iter, real_space=true, kT=kT)
         else
-            P_k_0 = real_to_k_P(P_real_0, N)
+            P_k_0 = real_to_k_P(P_0, N)
             P_k_out = SCF_HF(N, N_e, 1, ut, P_k_0, ϵ, max_iter, real_space=false, kT=kT)
             P_out = k_to_real_P(P_k_out, N)
         end
@@ -447,25 +694,20 @@ function plot_1rdm(P, N; layout=:blocked, title="")
     return fig
 end
 
-# ============================================
+# ========================================================================================
 # Code for testing
-# ============================================
+# ========================================================================================
 
-Random.seed!(11223)
+Random.seed!(123)
 
-N = 30
-N_e = 30     # <N_e> (exact number at T=0, EV at T>0)
-ut = 4
-n_samples = 30
-ϵ = 1e-7
-max_iter = 1000
+N, t, U = 40, 1.0, 4.0
+N_e = 80
+m0 = 0.1
+P_0 = Diagonal([(1+m0)/2, (1-m0)/2, (1-m0)/2, (1+m0)/2])   # 1↑, 2↑, 1↓, 2↓
 
-m_out = magnetization_alternating_sites(N, N_e, ut, n_samples, ϵ, max_iter, real_space=false, kT=0.001)
+Pbar, E, μ = SCF_2_site_cells_HF(N, N_e, t, U, P_0)
+plot_bands_2site(Pbar, t, U, μ)
 
-ut_interval = 0:(10 / n_samples):10
-
-plt.plot(ut_interval, m_out)
+plt.title("band structure N = $N, N_e = $N_e, t = $t, U = $U")
+plt.savefig("band structure N = $N, N_e = $N_e, t = $t, U = $U.png")
 plt.show()
-
-# I could improve on convergence by adding energy kicks every 200 or so iterations
-# or making it so that if the difference stays high for too long then it resets
