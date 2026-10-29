@@ -12,7 +12,7 @@ println("Finished Importing")
 delta(i, j) = (i == j) ? 1 : 0    # Kronecker delta function
 
 
-function random_unitary(n)        # Stole this from somewhere
+function random_unitary(n)        
     Z = randn(ComplexF64, n, n)
     Q, R = qr(Z)
     return Matrix(Q) * Diagonal(diag(R) ./ abs.(diag(R)))
@@ -120,7 +120,7 @@ function hopping_matrix_k_space(N, t)
 end
 
 
-function HF_Hubbard_Hamiltonian_k_space(N, T, U, P)    # Ivan said this part can be improved with sparce matrices (for RHF)
+function HF_Hubbard_Hamiltonian_k_space(N, T, U, P)    # this part can be improved with sparce matrices (for RHF)
     H = copy(T)
 
     for i in 1:2*N, j in 1:2*N                # O(N^3)
@@ -167,7 +167,6 @@ fermi(x) = x > 0 ? exp(-x) / (1 + exp(-x)) : 1 / (1 + exp(x))
 function find_chemical_potential(N_e, eigen_energies, kT; tol=1e-13, max_iter=200)
     n_avg(μ) = sum(fermi((e - μ) / kT) for e in eigen_energies)
 
-    # i'm not exactly sure why we would take these bounds that Claude gave me
     lo = minimum(eigen_energies) - 40*kT
     hi = maximum(eigen_energies) + 40*kT
 
@@ -251,11 +250,11 @@ end
 
 
 # ========================================================================================
-# RHF Functions (using GHF framework [doesn't work that well])
+# RHF Functions (using GHF framework [doesn't work that well currently, projection issues])
 # ========================================================================================
 
 function generate_rand_restricted_1rdm(N, N_e)
-    nocc = Int(N_e / 2)                       # orbitals per spin
+    nocc = Int(N_e / 2)                  # orbitals per spin
     V = random_unitary(N)                # N×N, not 2N×2N
     Pσ = V[:, 1:nocc] * V[:, 1:nocc]'    # rank-nocc projector
     P = zeros(ComplexF64, 2N, 2N)
@@ -454,7 +453,7 @@ function SCF_2_site_cells_HF(N, N_e, t, U, P_0; b=1.0, kT=0.0, ϵ=1e-6, max_iter
             return Pbar_p, E, μ
         end
 
-        # ODA: E(λ) = E(P̃) + s λ + c λ², with ΔP = P⁺ - P̃
+        # ODA
         ΔPk   = Pk_p .- Pk_t
         ΔPbar = Pbar_p - Pbar_t
         s = real(sum(tr(Hs[i] * ΔPk[i]) for i in 1:N)) / N
